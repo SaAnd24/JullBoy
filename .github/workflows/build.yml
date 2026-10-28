@@ -1,0 +1,141 @@
+name: JullBoy ZIP a APK
+# Sube JullBoy.zip (o cualquier .zip del proyecto) a tu repositorio.
+# Este workflow lo encuentra, lo descomprime y compila el APK de prueba.
+# No necesita secretos. Guárdalo como: .github/workflows/build.yml
+
+on:
+  push:
+    paths:
+      - "**.zip"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "Ruta del ZIP dentro del repositorio (vacío = detectarlo solo)"
+        required: false
+        default: ""
+      tests:
+        description: "Ejecutar también los tests (más lento; no bloquea el APK)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Descomprimir y compilar
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RAVENEMU_VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Localizar y descomprimir el ZIP
+        id: src
+        env:
+          ZIP_INPUT: ${{ github.event.inputs.zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/_jullboy"
+          rm -rf "$dest"; mkdir -p "$dest"
+
+          zip=""
+          if [[ -n "${ZIP_INPUT:-}" ]]; then
+            zip="$ZIP_INPUT"
+            [[ -f "$zip" ]] || { echo "::error::No existe el ZIP indicado: $zip"; exit 1; }
+          else
+            # 1) ZIP tocado por el último commit; 2) el último por nombre.
+            zip="$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null | grep -i '\.zip$' | tail -n 1 || true)"
+            if [[ -z "$zip" || ! -f "$zip" ]]; then
+              zip="$(find . -path ./_jullboy -prune -o -path ./.git -prune -o -type f -iname '*.zip' -print | sort | tail -n 1 | sed 's|^\./||')"
+            fi
+          fi
+
+          if [[ -n "$zip" ]]; then
+            echo "ZIP elegido: $zip"
+            unzip -q -o "$zip" -d "$dest"
+          elif [[ -f gradlew ]]; then
+            echo "::notice::No hay ZIP; se compila el proyecto que ya está en la raíz del repositorio."
+            tar --exclude=./_jullboy --exclude=./.git -cf - . | tar -xf - -C "$dest"
+          else
+            echo "::error::No encontré ningún .zip ni un proyecto (gradlew) en el repositorio."
+            exit 1
+          fi
+
+          # El proyecto puede estar en la raíz del ZIP o dentro de una carpeta.
+          gradlew="$(find "$dest" -maxdepth 3 -name gradlew -type f | sort | head -n 1)"
+          if [[ -z "$gradlew" ]]; then
+            echo "::error::El ZIP no contiene un proyecto Gradle (no hay gradlew)."
+            exit 1
+          fi
+          root="$(dirname "$gradlew")"
+          chmod +x "$gradlew"
+          [[ -f "$root/androidApp/build.gradle.kts" ]] || { echo "::error::Falta androidApp/build.gradle.kts en $root"; exit 1; }
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "Proyecto: $root"
+          ls "$root"
+
+      - name: Valider le wrapper Gradle
+        uses: gradle/actions/wrapper-validation@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - name: Installer Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # APK «beta»: como el de depuración, pero sin el indicador depurable (más rápido en el teléfono).
+      - name: Compilar el APK
+        working-directory: ${{ steps.src.outputs.root }}
+        shell: bash
+        run: ./gradlew :androidApp:assembleBeta --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Datos del APK
+        working-directory: ${{ steps.src.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/salida"
+          cp androidApp/build/outputs/apk/beta/*.apk "$GITHUB_WORKSPACE/salida/JullBoy.apk"
+          cd "$GITHUB_WORKSPACE/salida"
+          sha256sum JullBoy.apk | tee SHA256.txt
+          {
+            echo "### APK compilado"
+            echo "- Archivo: \`JullBoy.apk\` ($(du -h JullBoy.apk | cut -f1))"
+            echo "- SHA-256: \`$(cut -d' ' -f1 SHA256.txt)\`"
+            echo "- Firma: clave de depuración (sin secretos). Se instala sin problema en el teléfono."
+            echo "- Descárgalo en **Artifacts**, al final de esta página."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # El APK se publica antes de los tests: si fallan, el APK sigue disponible.
+      - name: Publicar el APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jullboy-apk
+          path: salida/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Tests (opcional)
+        if: github.event.inputs.tests == 'true'
+        continue-on-error: true
+        working-directory: ${{ steps.src.outputs.root }}
+        shell: bash
+        run: ./gradlew :androidApp:testDebugUnitTest :shared:testAndroidHostTest --stacktrace 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+
+      # Si la compilación falla, aquí queda el registro para copiar el error.
+      - name: Guardar el registro
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registro-compilacion
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
